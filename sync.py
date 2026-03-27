@@ -3,6 +3,12 @@ EmailBison → Close CRM Sync
 Polls EmailBison for replies across configured campaigns and creates/updates
 leads + contacts in Close CRM. Tracks processed reply IDs in state.json to
 avoid duplicates across runs.
+
+Fixes applied:
+  1. Skips automated/OOO replies — only syncs genuine human replies
+  2. Searches for existing company leads first; adds as contact if found
+  3. Contact name is correctly populated on create and update
+  4. All new leads are assigned to Daniel Bustos via Lead Owner custom field
 """
 
 import json
@@ -19,17 +25,38 @@ import requests
 # ---------------------------------------------------------------------------
 
 EMAILBISON_API_KEY = os.environ["EMAILBISON_API_KEY"]
-EMAILBISON_BASE_URL = os.environ["EMAILBISON_BASE_URL"].rstrip("/")  # e.g. https://dedi.emailbison.com
+EMAILBISON_BASE_URL = os.environ["EMAILBISON_BASE_URL"].rstrip("/")
 
 CLOSE_API_KEY = os.environ["CLOSE_API_KEY"]
 CLOSE_BASE_URL = "https://api.close.com/api/v1"
 
-# Campaigns to watch — must match names exactly as they appear in EmailBison
+# Daniel Bustos — assigned to all new/updated leads
+DANIEL_MEMBER_ID = "memb_uwjFLJqk0bD1usjzeAMZIZq3CvENPYTZUbpctAXtCQ8"
+
+# Custom field key for Lead Owner — find this in your existing Close scripts
+# or go to Settings → Custom Fields in Close and check the API name.
+# It will look like: "custom.cf_xxxxxxxxxxxxxxxxxxxxxxxx"
+LEAD_OWNER_FIELD = os.environ.get("CLOSE_LEAD_OWNER_FIELD", "custom.Lead Owner")
+
 TARGET_CAMPAIGNS = [
     "Irving Campaign March 23rd 2026",
     "David Campaign March 23rd 2026",
     "Barry Campaign March 23rd 2026",
 ]
+
+# EmailBison reply categories/types that indicate automated/OOO — not real humans
+AUTO_REPLY_INDICATORS = {
+    "auto_reply",
+    "auto-reply",
+    "automated_reply",
+    "automated reply",
+    "out_of_office",
+    "out-of-office",
+    "ooo",
+    "bounce",
+    "bounced",
+    "unsubscribe",
+}
 
 STATE_FILE = Path(__file__).parent / "state.json"
 
@@ -41,7 +68,7 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# State helpers (tracks which reply IDs have already been synced)
+# State helpers
 # ---------------------------------------------------------------------------
 
 def load_state() -> dict:
@@ -55,7 +82,7 @@ def save_state(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# EmailBison API helpers
+# EmailBison helpers
 # ---------------------------------------------------------------------------
 
 EB_HEADERS = {
@@ -65,13 +92,12 @@ EB_HEADERS = {
 
 
 def eb_get(path: str, params: dict = None) -> dict:
-    """GET from EmailBison with basic rate-limit handling."""
     url = f"{EMAILBISON_BASE_URL}/api{path}"
     for attempt in range(3):
         resp = requests.get(url, headers=EB_HEADERS, params=params, timeout=30)
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", resp.json().get("retry_after", 10)))
-            log.warning("EmailBison rate limited. Waiting %ss…", retry_after)
+            log.warning("EmailBison rate limited. Waiting %ss...", retry_after)
             time.sleep(retry_after)
             continue
         resp.raise_for_status()
@@ -79,94 +105,130 @@ def eb_get(path: str, params: dict = None) -> dict:
     raise RuntimeError("EmailBison: exceeded retry limit on rate limiting.")
 
 
-def get_target_campaign_ids() -> dict[str, int]:
-    """Return {campaign_name: campaign_id} for each campaign in TARGET_CAMPAIGNS."""
+def is_automated_reply(reply: dict) -> bool:
+    """
+    Return True if this reply looks like an auto-reply / OOO / bounce.
+    Checks type/category fields, tags array, and subject line heuristics.
+    """
+    for field in ("type", "category", "reply_type", "status"):
+        val = str(reply.get(field, "")).lower().replace(" ", "_")
+        if val in AUTO_REPLY_INDICATORS:
+            log.info("   Skipping automated reply (field '%s' = '%s')", field, val)
+            return True
+
+    tags = reply.get("tags") or []
+    if isinstance(tags, list):
+        for tag in tags:
+            if str(tag).lower().replace(" ", "_") in AUTO_REPLY_INDICATORS:
+                log.info("   Skipping automated reply (tag = '%s')", tag)
+                return True
+
+    subject = str(reply.get("subject") or reply.get("email_subject") or "").lower()
+    auto_subject_keywords = (
+        "automatic reply", "auto-reply", "out of office", "automatische antwort"
+    )
+    for kw in auto_subject_keywords:
+        if kw in subject:
+            log.info("   Skipping automated reply (subject contains '%s')", kw)
+            return True
+
+    return False
+
+
+def get_target_campaign_ids() -> dict:
     data = eb_get("/campaigns")
     campaigns = data.get("data", data) if isinstance(data, dict) else data
-
     found = {}
     for c in campaigns:
         if c.get("name") in TARGET_CAMPAIGNS:
             found[c["name"]] = c["id"]
-
     missing = set(TARGET_CAMPAIGNS) - set(found.keys())
     if missing:
         log.warning("Could not find EmailBison campaign(s): %s", missing)
-
     return found
 
 
-def get_replies_for_campaign(campaign_id: int) -> list[dict]:
-    """Fetch all replies for a given campaign."""
+def get_replies_for_campaign(campaign_id: int) -> list:
     data = eb_get("/replies", params={"campaign_id": campaign_id})
     return data.get("data", data) if isinstance(data, dict) else data
 
 
 def get_lead_by_id(lead_id: int) -> dict:
-    """Fetch a single EmailBison lead record."""
     data = eb_get(f"/leads/{lead_id}")
     return data.get("data", data) if isinstance(data, dict) else data
 
 
 def extract_contact_fields(eb_lead: dict) -> dict:
-    """
-    Normalise an EmailBison lead object into the fields we care about.
-    EmailBison stores contact info at the lead level; adjust key names
-    here if your workspace uses different field names.
-    """
+    first = eb_lead.get("first_name", "")
+    last  = eb_lead.get("last_name", "")
+    full  = eb_lead.get("full_name") or eb_lead.get("name", "")
+    if not full and (first or last):
+        full = f"{first} {last}".strip()
     return {
-        "full_name":   eb_lead.get("full_name") or eb_lead.get("name", "").strip(),
-        "email":       eb_lead.get("email", "").strip().lower(),
-        "job_title":   eb_lead.get("title") or eb_lead.get("job_title", ""),
-        "phone":       eb_lead.get("phone") or eb_lead.get("phone_number", ""),
-        "company":     eb_lead.get("company") or eb_lead.get("company_name", ""),
-        "website":     eb_lead.get("website") or eb_lead.get("url", ""),
-        "address":     eb_lead.get("address") or eb_lead.get("address_1", ""),
-        "city":        eb_lead.get("city", ""),
-        "state":       eb_lead.get("state", ""),
-        "zipcode":     eb_lead.get("zipcode") or eb_lead.get("postal_code", ""),
-        "country":     eb_lead.get("country", ""),
+        "full_name": full.strip(),
+        "email":     eb_lead.get("email", "").strip().lower(),
+        "job_title": eb_lead.get("title") or eb_lead.get("job_title", ""),
+        "phone":     eb_lead.get("phone") or eb_lead.get("phone_number", ""),
+        "company":   eb_lead.get("company") or eb_lead.get("company_name", ""),
+        "website":   eb_lead.get("website") or eb_lead.get("url", ""),
+        "address":   eb_lead.get("address") or eb_lead.get("address_1", ""),
+        "city":      eb_lead.get("city", ""),
+        "state":     eb_lead.get("state", ""),
+        "zipcode":   eb_lead.get("zipcode") or eb_lead.get("postal_code", ""),
+        "country":   eb_lead.get("country", ""),
     }
 
 
 # ---------------------------------------------------------------------------
-# Close CRM API helpers
+# Close CRM helpers
 # ---------------------------------------------------------------------------
 
-CLOSE_AUTH = (CLOSE_API_KEY, "")  # Close uses API key as Basic auth username
+CLOSE_AUTH    = (CLOSE_API_KEY, "")
 CLOSE_HEADERS = {"Content-Type": "application/json"}
 
 
 def close_get(path: str, params: dict = None) -> dict:
-    url = f"{CLOSE_BASE_URL}{path}"
-    resp = requests.get(url, auth=CLOSE_AUTH, headers=CLOSE_HEADERS, params=params, timeout=30)
+    resp = requests.get(
+        f"{CLOSE_BASE_URL}{path}", auth=CLOSE_AUTH,
+        headers=CLOSE_HEADERS, params=params, timeout=30
+    )
     resp.raise_for_status()
     return resp.json()
 
 
 def close_post(path: str, payload: dict) -> dict:
-    url = f"{CLOSE_BASE_URL}{path}"
-    resp = requests.post(url, auth=CLOSE_AUTH, headers=CLOSE_HEADERS, json=payload, timeout=30)
+    resp = requests.post(
+        f"{CLOSE_BASE_URL}{path}", auth=CLOSE_AUTH,
+        headers=CLOSE_HEADERS, json=payload, timeout=30
+    )
     resp.raise_for_status()
     return resp.json()
 
 
 def close_put(path: str, payload: dict) -> dict:
-    url = f"{CLOSE_BASE_URL}{path}"
-    resp = requests.put(url, auth=CLOSE_AUTH, headers=CLOSE_HEADERS, json=payload, timeout=30)
+    resp = requests.put(
+        f"{CLOSE_BASE_URL}{path}", auth=CLOSE_AUTH,
+        headers=CLOSE_HEADERS, json=payload, timeout=30
+    )
     resp.raise_for_status()
     return resp.json()
 
 
 def find_lead_by_email(email: str) -> dict | None:
-    """Search Close for any lead that has this email on a contact."""
     result = close_get("/lead/", params={"query": f'email_address:"{email}"'})
     leads = result.get("data", [])
     return leads[0] if leads else None
 
 
+def find_lead_by_company(company_name: str) -> dict | None:
+    if not company_name:
+        return None
+    result = close_get("/lead/", params={"query": f'name:"{company_name}"'})
+    leads = result.get("data", [])
+    return leads[0] if leads else None
+
+
 def find_contact_by_email(lead: dict, email: str) -> dict | None:
-    """Find the specific contact on a lead that matches the email."""
     for contact in lead.get("contacts", []):
         for e in contact.get("emails", []):
             if e.get("email", "").lower() == email.lower():
@@ -175,33 +237,14 @@ def find_contact_by_email(lead: dict, email: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Core create / update logic
+# Create / update logic
 # ---------------------------------------------------------------------------
 
-def build_lead_payload(fields: dict) -> dict:
-    """Build a Close lead creation payload from normalised fields."""
-    payload: dict = {}
+def lead_owner_payload() -> dict:
+    return {LEAD_OWNER_FIELD: DANIEL_MEMBER_ID}
 
-    if fields["company"]:
-        payload["name"] = fields["company"]
-    elif fields["full_name"]:
-        payload["name"] = fields["full_name"]  # fallback for B2C
 
-    if fields["website"]:
-        payload["url"] = fields["website"]
-
-    # Address
-    if any(fields[k] for k in ("address", "city", "state", "zipcode", "country")):
-        payload["addresses"] = [{
-            "label":      "office",
-            "address_1":  fields["address"],
-            "city":       fields["city"],
-            "state":      fields["state"],
-            "zipcode":    fields["zipcode"],
-            "country":    fields["country"],
-        }]
-
-    # Embed contact inline on creation
+def build_new_contact(fields: dict) -> dict:
     contact: dict = {}
     if fields["full_name"]:
         contact["name"] = fields["full_name"]
@@ -211,32 +254,62 @@ def build_lead_payload(fields: dict) -> dict:
         contact["emails"] = [{"type": "office", "email": fields["email"]}]
     if fields["phone"]:
         contact["phones"] = [{"type": "office", "phone": fields["phone"]}]
+    return contact
 
+
+def create_brand_new_lead(fields: dict) -> dict:
+    """Create a new lead + embedded contact in Close, assigned to Daniel."""
+    payload: dict = {**lead_owner_payload()}
+    payload["name"] = fields["company"] or fields["full_name"] or "Unknown"
+
+    if fields["website"]:
+        payload["url"] = fields["website"]
+
+    if any(fields[k] for k in ("address", "city", "state", "zipcode", "country")):
+        payload["addresses"] = [{
+            "label":     "office",
+            "address_1": fields["address"],
+            "city":      fields["city"],
+            "state":     fields["state"],
+            "zipcode":   fields["zipcode"],
+            "country":   fields["country"],
+        }]
+
+    contact = build_new_contact(fields)
     if contact:
         payload["contacts"] = [contact]
 
-    return payload
-
-
-def create_lead(fields: dict) -> dict:
-    payload = build_lead_payload(fields)
     lead = close_post("/lead/", payload)
-    log.info("  ✅ Created Close lead '%s' (id=%s)", lead.get("name"), lead.get("id"))
+    log.info("  Created new lead '%s' (id=%s)", lead.get("name"), lead.get("id"))
     return lead
 
 
-def update_existing_lead(lead: dict, contact: dict, fields: dict) -> None:
-    """Patch lead-level fields and the matched contact."""
+def add_contact_to_existing_lead(lead: dict, fields: dict) -> None:
+    """Add a new contact to an existing lead and assign to Daniel."""
     lead_id = lead["id"]
-    lead_updates: dict = {}
+    contact = build_new_contact(fields)
+    if contact:
+        contact["lead_id"] = lead_id
+        close_post("/contact/", contact)
+        log.info(
+            "  Added contact '%s' to existing lead '%s'",
+            fields["full_name"] or fields["email"], lead.get("name")
+        )
+    if not lead.get(LEAD_OWNER_FIELD):
+        close_put(f"/lead/{lead_id}/", lead_owner_payload())
+        log.info("  Assigned lead to Daniel Bustos")
 
-    # Only update lead-level fields if they're currently empty
+
+def update_existing_contact(lead: dict, contact: dict, fields: dict) -> None:
+    """Patch empty fields on existing lead + contact, assign to Daniel."""
+    lead_id    = lead["id"]
+    contact_id = contact["id"]
+
+    lead_updates: dict = {**lead_owner_payload()}
     if fields["website"] and not lead.get("url"):
         lead_updates["url"] = fields["website"]
-
     if fields["company"] and not lead.get("name"):
         lead_updates["name"] = fields["company"]
-
     if fields["address"] and not lead.get("addresses"):
         lead_updates["addresses"] = [{
             "label":     "office",
@@ -246,15 +319,9 @@ def update_existing_lead(lead: dict, contact: dict, fields: dict) -> None:
             "zipcode":   fields["zipcode"],
             "country":   fields["country"],
         }]
+    close_put(f"/lead/{lead_id}/", lead_updates)
 
-    if lead_updates:
-        close_put(f"/lead/{lead_id}/", lead_updates)
-        log.info("  ✏️  Updated lead fields: %s", list(lead_updates.keys()))
-
-    # Update contact
-    contact_id = contact["id"]
     contact_updates: dict = {}
-
     if fields["full_name"] and not contact.get("name"):
         contact_updates["name"] = fields["full_name"]
     if fields["job_title"] and not contact.get("title"):
@@ -264,10 +331,9 @@ def update_existing_lead(lead: dict, contact: dict, fields: dict) -> None:
 
     if contact_updates:
         close_put(f"/contact/{contact_id}/", contact_updates)
-        log.info("  ✏️  Updated contact fields: %s", list(contact_updates.keys()))
+        log.info("  Updated contact fields: %s", list(contact_updates.keys()))
 
-    if not lead_updates and not contact_updates:
-        log.info("  ↩️  Lead/contact already up to date, no changes needed.")
+    log.info("  Updated lead '%s' — assigned to Daniel", lead.get("name"))
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +353,12 @@ def run_sync() -> None:
     total_created = 0
     total_updated = 0
     total_skipped = 0
+    total_auto    = 0
 
     for campaign_name, campaign_id in campaign_ids.items():
-        log.info("📋 Processing campaign: %s (id=%s)", campaign_name, campaign_id)
+        log.info("Processing campaign: %s (id=%s)", campaign_name, campaign_id)
         replies = get_replies_for_campaign(campaign_id)
-        log.info("   Found %d replies.", len(replies))
+        log.info("  Found %d replies.", len(replies))
 
         for reply in replies:
             reply_id = str(reply.get("id"))
@@ -300,58 +367,78 @@ def run_sync() -> None:
                 total_skipped += 1
                 continue
 
-            lead_id = reply.get("lead_id") or reply.get("leadId")
-            if not lead_id:
-                log.warning("   Reply %s has no lead_id — skipping.", reply_id)
+            if is_automated_reply(reply):
+                total_auto += 1
                 new_processed.append(reply_id)
                 continue
 
-            # Fetch full lead data from EmailBison
+            lead_id = reply.get("lead_id") or reply.get("leadId")
+            if not lead_id:
+                log.warning("  Reply %s has no lead_id — skipping.", reply_id)
+                new_processed.append(reply_id)
+                continue
+
             try:
                 eb_lead = get_lead_by_id(lead_id)
             except Exception as exc:
-                log.error("   Failed to fetch EmailBison lead %s: %s", lead_id, exc)
+                log.error("  Failed to fetch EmailBison lead %s: %s", lead_id, exc)
                 continue
 
             fields = extract_contact_fields(eb_lead)
 
             if not fields["email"]:
-                log.warning("   Lead %s has no email — skipping.", lead_id)
+                log.warning("  Lead %s has no email — skipping.", lead_id)
                 new_processed.append(reply_id)
                 continue
 
-            log.info("   → %s <%s> @ %s", fields["full_name"], fields["email"], fields["company"])
+            log.info(
+                "  -> %s <%s> @ %s",
+                fields["full_name"] or "(no name)",
+                fields["email"],
+                fields["company"] or "(no company)",
+            )
 
             try:
+                # Priority 1: match by email
                 existing_lead = find_lead_by_email(fields["email"])
-
                 if existing_lead:
                     contact = find_contact_by_email(existing_lead, fields["email"])
                     if contact:
-                        log.info("   🔍 Lead exists in Close — updating.")
-                        update_existing_lead(existing_lead, contact, fields)
+                        log.info("  Email matched existing lead — updating.")
+                        update_existing_contact(existing_lead, contact, fields)
+                    else:
+                        log.info("  Lead matched by email — adding contact.")
+                        add_contact_to_existing_lead(existing_lead, fields)
+                    total_updated += 1
+
+                else:
+                    # Priority 2: match by company name
+                    company_lead = find_lead_by_company(fields["company"])
+                    if company_lead:
+                        log.info(
+                            "  Company '%s' already exists — adding contact.",
+                            fields["company"]
+                        )
+                        add_contact_to_existing_lead(company_lead, fields)
                         total_updated += 1
                     else:
-                        log.warning("   Lead found but contact not matched — skipping update.")
-                else:
-                    log.info("   🆕 New lead — creating in Close.")
-                    create_lead(fields)
-                    total_created += 1
+                        # Priority 3: create new lead
+                        log.info("  No match found — creating new lead.")
+                        create_brand_new_lead(fields)
+                        total_created += 1
 
                 new_processed.append(reply_id)
 
             except requests.HTTPError as exc:
-                log.error("   Close API error for reply %s: %s", reply_id, exc)
-                # Don't mark as processed so it retries next run
+                log.error("  Close API error for reply %s: %s", reply_id, exc)
                 continue
 
-    # Persist updated state
     state["processed_reply_ids"] = list(processed_ids | set(new_processed))
     save_state(state)
 
     log.info(
-        "✅ Sync complete — created: %d | updated: %d | skipped (already synced): %d",
-        total_created, total_updated, total_skipped,
+        "Sync complete — created: %d | updated: %d | auto-replies filtered: %d | already synced: %d",
+        total_created, total_updated, total_auto, total_skipped,
     )
 
 
