@@ -36,11 +36,11 @@ DANIEL_MEMBER_ID = "memb_uwjFLJqk0bD1usjzeAMZIZq3CvENPYTZUbpctAXtCQ8"
 # Custom field key for Lead Owner — find this in your existing Close scripts
 # or go to Settings → Custom Fields in Close and check the API name.
 # It will look like: "custom.cf_xxxxxxxxxxxxxxxxxxxxxxxx"
-LEAD_OWNER_FIELD = os.environ.get("CLOSE_LEAD_OWNER_FIELD", "custom.Lead Owner")
+LEAD_OWNER_FIELD = os.environ.get("CLOSE_LEAD_OWNER_FIELD", "custom.cf_b2zY10nphhbuwEoX4rNFIOHWxkPYQ0QtEhg73PIhwP6")
 
 TARGET_CAMPAIGNS = [
-    "Irving Campaign March 23rd 2026",
-    "David Campaign March 23rd 2026",
+    "Irving Campaign March 23rd  2026",
+    "David Campaign March 23rd  2026",
     "Barry Campaign March 23rd 2026",
 ]
 
