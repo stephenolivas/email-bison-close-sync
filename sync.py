@@ -214,6 +214,28 @@ def close_put(path: str, payload: dict) -> dict:
     return resp.json()
 
 
+def create_reply_note(close_lead_id: str, reply: dict, campaign_name: str, fields: dict) -> None:
+    """Post the most recent EmailBison reply as a note on the Close lead."""
+    subject  = reply.get("subject") or reply.get("email_subject") or "(no subject)"
+    body     = reply.get("body") or reply.get("email_body") or reply.get("content") or "(no body)"
+    replied_at = reply.get("created_at") or reply.get("replied_at") or reply.get("date") or ""
+
+    note_text = (
+        f"📧 EmailBison Reply — {campaign_name}\n"
+        f"From: {fields['full_name'] or '(unknown)'} <{fields['email']}>\n"
+        f"Subject: {subject}\n"
+        f"Date: {replied_at}\n"
+        f"{'─' * 40}\n"
+        f"{body}"
+    )
+
+    close_post("/activity/note/", {
+        "lead_id": close_lead_id,
+        "note":    note_text,
+    })
+    log.info("  Added reply note to lead %s", close_lead_id)
+
+
 def find_lead_by_email(email: str) -> dict | None:
     result = close_get("/lead/", params={"query": f'email_address:"{email}"'})
     leads = result.get("data", [])
@@ -399,6 +421,8 @@ def run_sync() -> None:
             )
 
             try:
+                close_lead_id: str | None = None
+
                 # Priority 1: match by email
                 existing_lead = find_lead_by_email(fields["email"])
                 if existing_lead:
@@ -409,6 +433,7 @@ def run_sync() -> None:
                     else:
                         log.info("  Lead matched by email — adding contact.")
                         add_contact_to_existing_lead(existing_lead, fields)
+                    close_lead_id = existing_lead["id"]
                     total_updated += 1
 
                 else:
@@ -420,12 +445,18 @@ def run_sync() -> None:
                             fields["company"]
                         )
                         add_contact_to_existing_lead(company_lead, fields)
+                        close_lead_id = company_lead["id"]
                         total_updated += 1
                     else:
                         # Priority 3: create new lead
                         log.info("  No match found — creating new lead.")
-                        create_brand_new_lead(fields)
+                        new_lead = create_brand_new_lead(fields)
+                        close_lead_id = new_lead["id"]
                         total_created += 1
+
+                # Post the reply body as a note on the Close lead
+                if close_lead_id:
+                    create_reply_note(close_lead_id, reply, campaign_name, fields)
 
                 new_processed.append(reply_id)
 
