@@ -216,6 +216,10 @@ def close_put(path: str, payload: dict) -> dict:
 
 def create_reply_note(close_lead_id: str, reply: dict, campaign_name: str, fields: dict) -> None:
     """Post the most recent EmailBison reply as a note on the Close lead."""
+    # DEBUG — log raw reply keys so we can find the correct body field name
+    log.info("  [DEBUG] Reply keys: %s", list(reply.keys()))
+    log.info("  [DEBUG] Reply sample: %s", {k: str(v)[:120] for k, v in reply.items()})
+
     subject  = reply.get("subject") or reply.get("email_subject") or "(no subject)"
     body     = reply.get("body") or reply.get("email_body") or reply.get("content") or "(no body)"
     replied_at = reply.get("created_at") or reply.get("replied_at") or reply.get("date") or ""
