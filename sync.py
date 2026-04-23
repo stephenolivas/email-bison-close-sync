@@ -106,16 +106,24 @@ def eb_get(path: str, params: dict = None) -> dict:
 
 
 def is_automated_reply(reply: dict) -> bool:
-    """
-    Return True if this reply looks like an auto-reply / OOO / bounce.
-    Checks type/category fields, tags array, and subject line heuristics.
-    """
-    for field in ("type", "category", "reply_type", "status"):
-        val = str(reply.get(field, "")).lower().replace(" ", "_")
-        if val in AUTO_REPLY_INDICATORS:
-            log.info("   Skipping automated reply (field '%s' = '%s')", field, val)
-            return True
+    """Return True if this reply should be skipped — auto-reply, bounce, or outgoing email."""
+    # Skip outgoing emails — we only want inbound replies from prospects
+    reply_type = str(reply.get("type", "")).lower()
+    if reply_type in ("outgoing email", "outgoing_email"):
+        log.info("   Skipping outgoing email (type = '%s')", reply_type)
+        return True
 
+    # Use EmailBison's own automated_reply flag first
+    if str(reply.get("automated_reply", "")).lower() == "true":
+        log.info("   Skipping automated reply (automated_reply = True)")
+        return True
+
+    # Fallback: type-based checks
+    if reply_type in AUTO_REPLY_INDICATORS:
+        log.info("   Skipping automated reply (type = '%s')", reply_type)
+        return True
+
+    # Tag-based checks
     tags = reply.get("tags") or []
     if isinstance(tags, list):
         for tag in tags:
@@ -123,11 +131,9 @@ def is_automated_reply(reply: dict) -> bool:
                 log.info("   Skipping automated reply (tag = '%s')", tag)
                 return True
 
+    # Subject line heuristics as final fallback
     subject = str(reply.get("subject") or reply.get("email_subject") or "").lower()
-    auto_subject_keywords = (
-        "automatic reply", "auto-reply", "out of office", "automatische antwort"
-    )
-    for kw in auto_subject_keywords:
+    for kw in ("automatic reply", "auto-reply", "out of office", "automatische antwort"):
         if kw in subject:
             log.info("   Skipping automated reply (subject contains '%s')", kw)
             return True
@@ -216,13 +222,9 @@ def close_put(path: str, payload: dict) -> dict:
 
 def create_reply_note(close_lead_id: str, reply: dict, campaign_name: str, fields: dict) -> None:
     """Post the most recent EmailBison reply as a note on the Close lead."""
-    # DEBUG — log raw reply keys so we can find the correct body field name
-    log.info("  [DEBUG] Reply keys: %s", list(reply.keys()))
-    log.info("  [DEBUG] Reply sample: %s", {k: str(v)[:120] for k, v in reply.items()})
-
-    subject  = reply.get("subject") or reply.get("email_subject") or "(no subject)"
-    body     = reply.get("body") or reply.get("email_body") or reply.get("content") or "(no body)"
-    replied_at = reply.get("created_at") or reply.get("replied_at") or reply.get("date") or ""
+    subject    = reply.get("subject") or "(no subject)"
+    body       = reply.get("text_body") or reply.get("html_body") or "(no body)"
+    replied_at = reply.get("date_received") or reply.get("created_at") or ""
 
     note_text = (
         f"📧 EmailBison Reply — {campaign_name}\n"
