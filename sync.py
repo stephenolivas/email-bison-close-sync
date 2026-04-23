@@ -31,7 +31,7 @@ CLOSE_API_KEY = os.environ["CLOSE_API_KEY"]
 CLOSE_BASE_URL = "https://api.close.com/api/v1"
 
 # Daniel Bustos — assigned to all new/updated leads
-DANIEL_MEMBER_ID = "memb_uwjFLJqk0bD1usjzeAMZIZq3CvENPYTZUbpctAXtCQ8"
+DANIEL_USER_ID = "user_55d7txlF7FzJg2IUyN7M9KxUgXpQN8LS7qxGQ22WmNc"
 
 # Custom field key for Lead Owner — find this in your existing Close scripts
 # or go to Settings → Custom Fields in Close and check the API name.
@@ -263,7 +263,7 @@ def find_contact_by_email(lead: dict, email: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def lead_owner_payload() -> dict:
-    return {LEAD_OWNER_FIELD: DANIEL_MEMBER_ID}
+    return {LEAD_OWNER_FIELD: DANIEL_USER_ID}
 
 
 def build_new_contact(fields: dict) -> dict:
@@ -420,9 +420,9 @@ def run_sync() -> None:
                 fields["company"] or "(no company)",
             )
 
-            try:
-                close_lead_id: str | None = None
+            close_lead_id: str | None = None
 
+            try:
                 # Priority 1: match by email
                 existing_lead = find_lead_by_email(fields["email"])
                 if existing_lead:
@@ -454,15 +454,18 @@ def run_sync() -> None:
                         close_lead_id = new_lead["id"]
                         total_created += 1
 
-                # Post the reply body as a note on the Close lead
-                if close_lead_id:
-                    create_reply_note(close_lead_id, reply, campaign_name, fields)
-
-                new_processed.append(reply_id)
-
             except requests.HTTPError as exc:
-                log.error("  Close API error for reply %s: %s", reply_id, exc)
-                continue
+                log.error("  Close API error (lead/contact) for reply %s: %s", reply_id, exc)
+
+            # Always attempt the note and always mark as processed,
+            # even if the lead update above had an error
+            if close_lead_id:
+                try:
+                    create_reply_note(close_lead_id, reply, campaign_name, fields)
+                except requests.HTTPError as exc:
+                    log.error("  Close API error (note) for reply %s: %s", reply_id, exc)
+
+            new_processed.append(reply_id)
 
     state["processed_reply_ids"] = list(processed_ids | set(new_processed))
     save_state(state)
